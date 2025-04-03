@@ -1,0 +1,14 @@
+The key fingerprint is:
+SHA256:OW+/UBw5f67J4IcV9TCA/p2NrVMTl+RIo+vpMViapD0 azuread\samanqaydi@PHR-SQAYDI
+The key's randomart image is:
++---[RSA 2048]----+
+|           ...   |
+|          .  +o..|
+|         .  * =+o|
+|         ..o =.+o|
+|        S. o+..*+|
+|        +o=o. =++|
+|       . E=ooo oo|
+|         ..*+o+o |
+|          ..+o+. |
++----[SHA256]-----+
