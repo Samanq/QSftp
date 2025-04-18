@@ -90,7 +90,8 @@ const server = new Server(
             
             try {
               const stats = fs.statSync(resolvedPath);
-              const mode = stats.isDirectory() ? 0o755 : 0o644 | 0o100000; // Add S_IFREG flag for regular files
+              // Add proper file type flags - 0o040000 is S_IFDIR (directory), 0o100000 is S_IFREG (regular file)
+              const mode = stats.isDirectory() ? 0o40755 : 0o100644;
               console.log('LSTAT file stats:', {
                 size: stats.size,
                 isDirectory: stats.isDirectory(),
@@ -120,7 +121,8 @@ const server = new Server(
             
             try {
               const stats = fs.statSync(resolvedPath);
-              const mode = stats.isDirectory() ? 0o755 : 0o644 | 0o100000; // Add S_IFREG flag for regular files
+              // Add proper file type flags - 0o040000 is S_IFDIR (directory), 0o100000 is S_IFREG (regular file)
+              const mode = stats.isDirectory() ? 0o40755 : 0o100644;
               console.log('File stats:', {
                 size: stats.size,
                 isDirectory: stats.isDirectory(),
@@ -144,38 +146,74 @@ const server = new Server(
           sftpStream.on('REALPATH', (reqid, filepath) => {
             console.log('REALPATH request for:', filepath);
             // Handle both absolute and relative paths
-            const normalizedPath = filepath === '.' ? '' : path.normalize(filepath.replace(/^\/+/, ''));
-            console.log('Normalized path:', normalizedPath);
+            let normalizedPath = filepath === '.' ? '' : path.normalize(filepath.replace(/^\/+/, ''));
+            const resolvedPath = resolvePath(filepath);
+            console.log('REALPATH normalized path:', normalizedPath);
+            console.log('REALPATH resolved path:', resolvedPath);
             
-            sftpStream.name(reqid, [{
-              filename: '/' + normalizedPath, // Always return absolute paths
-              longname: '/' + normalizedPath,
-              attrs: {
-                size: 0,
-                uid: 0,
-                gid: 0,
-                mode: 0o755,
-                atime: 0,
-                mtime: 0
-              }
-            }]);
+            // Check if the path exists and get stats
+            try {
+              const stats = fs.statSync(resolvedPath);
+              // Add proper file type flags - 0o040000 is S_IFDIR (directory), 0o100000 is S_IFREG (regular file)
+              const mode = stats.isDirectory() ? 0o40755 : 0o100644;
+              console.log('REALPATH stats:', {
+                isDirectory: stats.isDirectory(),
+                mode: mode.toString(8),
+                path: resolvedPath
+              });
+              
+              sftpStream.name(reqid, [{
+                filename: '/' + normalizedPath, // Always return absolute paths
+                longname: '/' + normalizedPath,
+                attrs: {
+                  size: stats.size,
+                  uid: 0,
+                  gid: 0,
+                  mode: mode,
+                  atime: stats.atime.getTime() / 1000,
+                  mtime: stats.mtime.getTime() / 1000
+                }
+              }]);
+            } catch (err) {
+              console.log('REALPATH error:', err.message);
+              // If the path doesn't exist, just return the normalized path anyway
+              sftpStream.name(reqid, [{
+                filename: '/' + normalizedPath,
+                longname: '/' + normalizedPath,
+                attrs: {
+                  size: 0,
+                  uid: 0,
+                  gid: 0,
+                  mode: 0o40755, // Always assume directory for non-existent paths
+                  atime: 0,
+                  mtime: 0
+                }
+              }]);
+            }
           });
 
           sftpStream.on('OPENDIR', (reqid, dir) => {
             console.log('Opening directory:', dir);
-            const dirPath = dir === '/' ? ROOT_DIR : path.join(ROOT_DIR, dir);
-            if (fs.existsSync(dirPath) && fs.statSync(dirPath).isDirectory()) {
-              const handle = Buffer.from(`dir-${Date.now()}`);
-              const files = fs.readdirSync(dirPath);
-              console.log('Directory contents:', files);
-              openDirectories.set(handle.toString(), {
-                path: dirPath,
-                files: files,
-                index: 0
-              });
-              sftpStream.handle(reqid, handle);
-            } else {
-              console.log('Directory not found:', dirPath);
+            const resolvedPath = resolvePath(dir);
+            console.log('OPENDIR resolved path:', resolvedPath);
+            
+            try {
+              if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()) {
+                const handle = Buffer.from(`dir-${Date.now()}`);
+                const files = fs.readdirSync(resolvedPath);
+                console.log('Directory contents:', files);
+                openDirectories.set(handle.toString(), {
+                  path: resolvedPath,
+                  files: files,
+                  index: 0
+                });
+                sftpStream.handle(reqid, handle);
+              } else {
+                console.log('Directory not found or not a directory:', resolvedPath);
+                sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
+              }
+            } catch (err) {
+              console.log('OPENDIR error:', err.message);
               sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
             }
           });
@@ -222,33 +260,118 @@ const server = new Server(
           sftpStream.on('OPEN', (reqid, filename, flags, attrs) => {
             console.log('\nOPEN command received');
             console.log('OPEN request for:', filename, 'flags:', flags);
+            console.log('Flags binary:', flags.toString(2));
+            
+            // Define the standard flags for better debugging
+            const flagsMap = {
+              O_RDONLY: 0,
+              O_WRONLY: 1,
+              O_RDWR: 2,
+              O_CREAT: 64,
+              O_TRUNC: 512,
+              O_APPEND: 1024
+            };
+            
+            // Log which flags are set
+            console.log('Detected flags:', 
+              Object.entries(flagsMap)
+                .filter(([_, value]) => (flags & value) === value)
+                .map(([key]) => key)
+                .join(', '));
+            
             const resolvedPath = resolvePath(filename);
             console.log('OPEN resolved path:', resolvedPath);
             
             try {
-              const stats = fs.statSync(resolvedPath);
-              if (!stats.isFile()) {
-                console.log('Not a regular file:', resolvedPath);
-                sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+              // Check if this is a write operation (WRONLY or RDWR)
+              const isWriteRequest = (flags & flagsMap.O_WRONLY) || (flags & flagsMap.O_RDWR);
+              const isCreateRequest = flags & flagsMap.O_CREAT;
+              
+              console.log('Write request:', isWriteRequest);
+              console.log('Create request:', isCreateRequest);
+              
+              // For file uploads, we create the file even if O_CREAT isn't set
+              // This handles clients like the sftp command that don't set O_CREAT
+              if (isWriteRequest) {
+                console.log('Creating file for writing:', resolvedPath);
+                
+                // Ensure the directory exists
+                const dirPath = path.dirname(resolvedPath);
+                if (!fs.existsSync(dirPath)) {
+                  console.log('Creating parent directories:', dirPath);
+                  fs.mkdirSync(dirPath, { recursive: true });
+                }
+                
+                // Always create the file for write operations
+                // Use 'w' for TRUNC, otherwise 'a+' which preserves content
+                const shouldTruncate = flags & flagsMap.O_TRUNC;
+                const writeFlag = shouldTruncate ? 'w' : 'a+';
+                
+                try {
+                  fs.closeSync(fs.openSync(resolvedPath, writeFlag));
+                  console.log('File created or opened for writing');
+                } catch (err) {
+                  console.log('Error creating/opening file:', err.message);
+                  sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+                  return;
+                }
+                
+                const handle = Buffer.from(resolvedPath);
+                sftpStream.handle(reqid, handle);
+                console.log('File handle sent to client');
                 return;
               }
               
-              const fd = fs.openSync(resolvedPath, 'r');
-              fs.closeSync(fd);
-              
-              const handle = Buffer.from(resolvedPath);
-              sftpStream.handle(reqid, handle);
+              // Regular file open for reading
+              if (fs.existsSync(resolvedPath)) {
+                const stats = fs.statSync(resolvedPath);
+                if (!stats.isFile()) {
+                  console.log('Not a regular file:', resolvedPath);
+                  sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+                  return;
+                }
+                
+                const handle = Buffer.from(resolvedPath);
+                sftpStream.handle(reqid, handle);
+                console.log('Existing file handle sent to client');
+              } else {
+                console.log('File not found:', resolvedPath);
+                sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
+              }
             } catch (err) {
               console.log('OPEN error:', err.message);
-              sftpStream.status(reqid, 2);
+              sftpStream.status(reqid, 4); // SSH_FX_FAILURE
             }
           });
 
           sftpStream.on('WRITE', (reqid, handle, offset, data) => {
             const filePath = handle.toString(); // Convert handle back to file path
             console.log(`WRITE request for: ${filePath}, offset: ${offset}, data length: ${data.length}`);
-            fs.writeFileSync(filePath, data, { flag: offset === 0 ? 'w' : 'r+' }); // Write or append data
-            sftpStream.status(reqid, 0); // Indicate success
+            
+            try {
+              // Make sure the file exists before attempting to write
+              if (!fs.existsSync(filePath)) {
+                console.log('File not found for writing:', filePath);
+                sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
+                return;
+              }
+              
+              // Open the file for writing with position
+              const fd = fs.openSync(filePath, 'r+');
+              try {
+                fs.writeSync(fd, data, 0, data.length, offset);
+                console.log(`Successfully wrote ${data.length} bytes to ${filePath} at offset ${offset}`);
+                sftpStream.status(reqid, 0); // SSH_FX_OK
+              } catch (writeErr) {
+                console.log('Write error:', writeErr.message);
+                sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+              } finally {
+                fs.closeSync(fd);
+              }
+            } catch (err) {
+              console.log('WRITE error:', err.message);
+              sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+            }
           });
 
           sftpStream.on('READ', (reqid, handle, offset, length) => {
@@ -281,6 +404,91 @@ const server = new Server(
               console.log('Closing directory handle:', handleKey);
             }
             sftpStream.status(reqid, 0); // Indicate success
+          });
+
+          sftpStream.on('MKDIR', (reqid, path, attrs) => {
+            console.log('MKDIR request for:', path);
+            const resolvedPath = resolvePath(path);
+            console.log('MKDIR resolved path:', resolvedPath);
+
+            try {
+              if (!fs.existsSync(resolvedPath)) {
+                fs.mkdirSync(resolvedPath, { recursive: true });
+                console.log('Directory created:', resolvedPath);
+                sftpStream.status(reqid, 0); // SSH_FX_OK
+              } else {
+                console.log('Directory already exists:', resolvedPath);
+                sftpStream.status(reqid, 4); // SSH_FX_FAILURE (already exists)
+              }
+            } catch (err) {
+              console.log('MKDIR error:', err.message);
+              sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+            }
+          });
+
+          sftpStream.on('SETSTAT', (reqid, path, attrs) => {
+            console.log('SETSTAT request for:', path);
+            const resolvedPath = resolvePath(path);
+            console.log('SETSTAT resolved path:', resolvedPath);
+
+            try {
+              if (fs.existsSync(resolvedPath)) {
+                if (attrs.mode !== undefined) {
+                  fs.chmodSync(resolvedPath, attrs.mode);
+                }
+                if (attrs.uid !== undefined && attrs.gid !== undefined) {
+                  fs.chownSync(resolvedPath, attrs.uid, attrs.gid);
+                }
+                console.log('Attributes updated for:', resolvedPath);
+                sftpStream.status(reqid, 0); // SSH_FX_OK
+              } else {
+                console.log('Path does not exist:', resolvedPath);
+                sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
+              }
+            } catch (err) {
+              console.log('SETSTAT error:', err.message);
+              sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+            }
+          });
+
+          sftpStream.on('REMOVE', (reqid, path) => {
+            console.log('REMOVE request for:', path);
+            const resolvedPath = resolvePath(path);
+            console.log('REMOVE resolved path:', resolvedPath);
+
+            try {
+              if (fs.existsSync(resolvedPath)) {
+                fs.unlinkSync(resolvedPath);
+                console.log('File removed:', resolvedPath);
+                sftpStream.status(reqid, 0); // SSH_FX_OK
+              } else {
+                console.log('File does not exist:', resolvedPath);
+                sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
+              }
+            } catch (err) {
+              console.log('REMOVE error:', err.message);
+              sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+            }
+          });
+
+          sftpStream.on('RMDIR', (reqid, path) => {
+            console.log('RMDIR request for:', path);
+            const resolvedPath = resolvePath(path);
+            console.log('RMDIR resolved path:', resolvedPath);
+
+            try {
+              if (fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()) {
+                fs.rmdirSync(resolvedPath);
+                console.log('Directory removed:', resolvedPath);
+                sftpStream.status(reqid, 0); // SSH_FX_OK
+              } else {
+                console.log('Directory not found or not a directory:', resolvedPath);
+                sftpStream.status(reqid, 2); // SSH_FX_NO_SUCH_FILE
+              }
+            } catch (err) {
+              console.log('RMDIR error:', err.message);
+              sftpStream.status(reqid, 4); // SSH_FX_FAILURE
+            }
           });
         });
       });
